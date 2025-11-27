@@ -1,5 +1,5 @@
 # RC-Telemetry-Challenge-2025-Grupo-Pico-Motorsport
-Documentacion del proyecto de Comunicaciones Digitales.
+Documentación del proyecto de Comunicaciones Digitales.(Codigos-Informe-Link video en Youtube)
 Integrantes: 
 Valentina Hernandez
 -Andrey Peña
