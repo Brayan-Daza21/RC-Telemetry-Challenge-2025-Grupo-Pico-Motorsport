@@ -1,0 +1,120 @@
+# PICO A: RECEPTOR DE CONTROL
+# - nRF24L01 (RX)
+# - Servo (GP16)
+# - ESC (GP17)
+
+from machine import Pin, SPI, PWM
+from nrf24l01 import NRF24L01
+import utime, struct
+
+CHANNEL = 100
+PAYLOAD = 4   # v1, v2 -> 2 x uint16
+
+PIPE_RX = b'\xe1\xf0\xf0\xf0\xf0'  # igual que PIPE_TX del control
+PIPE_TX = b'\xd2\xf0\xf0\xf0\xf0'  # no usado
+
+spi = SPI(0, sck=Pin(6), mosi=Pin(7), miso=Pin(4))
+ce  = Pin(14, Pin.OUT, value=0)
+csn = Pin(15, Pin.OUT, value=1)
+
+nrf = NRF24L01(spi, csn, ce, channel=CHANNEL, payload_size=PAYLOAD)
+
+try:
+    nrf.set_power_speed(NRF24L01.PA_MAX, NRF24L01.SPEED_250KBPS)
+except:
+    try:
+        nrf.set_power_speed(3, 0)
+    except:
+        pass
+
+try:
+    nrf.set_retries(5, 15)
+except:
+    pass
+
+nrf.open_rx_pipe(1, PIPE_RX)
+nrf.open_tx_pipe(PIPE_TX)
+nrf.start_listening()
+
+# SERVO GP16
+servo = PWM(Pin(16))
+servo.freq(50)
+
+def servo_write_us(us):
+    duty = int(us * 65535 * servo.freq() / 1_000_000)
+    servo.duty_u16(duty)
+
+def mover_servo_angulo(ang):
+    ang = max(40, min(140, int(ang)))
+    us = 500 + (ang / 180) * (2500 - 500)
+    servo_write_us(int(us))
+
+# ESC GP17
+esc = PWM(Pin(17))
+esc.freq(50)
+
+def esc_write_us(us):
+    duty = int(us * 65535 * esc.freq() / 1_000_000)
+    esc.duty_u16(duty)
+
+# Mapas joystick
+MID = 32768
+DEADZONE = 4000
+
+def map_dir_from_u16(v):
+    ang = int(v * 180 / 65535)
+    return max(30, min(150, ang))
+
+def map_esc_from_u16(v):
+    if abs(v - MID) <= DEADZONE:
+        return 1500
+    if v > MID + DEADZONE:
+        span = 65535 - (MID + DEADZONE)
+        rel = v - (MID + DEADZONE)
+        esc_min, esc_max = 1500, 1800
+        us = esc_min + (rel * (esc_max - esc_min) / span)
+        return int(us)
+    span = (MID - DEADZONE) - 0
+    rel = v - 0
+    esc_min, esc_max = 1200, 1500
+    us = esc_min + (rel * (esc_max - esc_min) / span)
+    return int(us)
+
+current_ang = 90
+current_esc_us = 1500
+mover_servo_angulo(current_ang)
+esc_write_us(current_esc_us)
+utime.sleep(1)
+
+last_rx = utime.ticks_ms()
+TIMEOUT_MS = 1000
+
+print("RX CONTROL listo, esperando paquetes...")
+
+while True:
+    if nrf.any():
+        data = nrf.recv()
+        if len(data) >= 4:
+            v1, v2 = struct.unpack('<HH', data[:4])
+        else:
+            continue
+
+        current_ang = map_dir_from_u16(v1)
+        mover_servo_angulo(current_ang)
+
+        current_esc_us = map_esc_from_u16(v2)
+        esc_write_us(current_esc_us)
+
+        last_rx = utime.ticks_ms()
+
+        print("RX v1:{:5d} v2:{:5d} | ang:{:3d} esc:{:4d}".format(
+            v1, v2, int(current_ang), int(current_esc_us)
+        ))
+    else:
+        if utime.ticks_diff(utime.ticks_ms(), last_rx) > TIMEOUT_MS:
+            current_ang = 90
+            current_esc_us = 1500
+            mover_servo_angulo(current_ang)
+            esc_write_us(current_esc_us)
+
+    utime.sleep_ms(10)

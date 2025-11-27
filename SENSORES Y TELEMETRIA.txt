@@ -1,0 +1,224 @@
+# PICO B: SENSORES + TELEMETRÍA (TX)
+# - OLED I2C0 (GP8/GP9)
+# - MPU6050 I2C0
+# - GPS NEO-6M UART0 (GP0/GP1)
+# - TCRT5000 GP18
+# - nRF24L01 TELEMETRÍA (SPI0 SCK=GP6, MOSI=GP7, MISO=GP4, CSN=GP21, CE=GP20)
+
+from machine import Pin, I2C, UART, SPI
+from ssd1306 import SSD1306_I2C
+from nrf24l01 import NRF24L01
+import utime, struct
+
+# ========================== OLED + I2C ==========================
+i2c = I2C(0, scl=Pin(9), sda=Pin(8))
+utime.sleep_ms(30)
+oled = SSD1306_I2C(128, 64, i2c)
+
+# ========================== MPU6050 ==========================
+class MPU6050:
+    def __init__(self, i2c, addr=0x68):
+        self.i2c = i2c
+        self.addr = addr
+        try:
+            self.i2c.writeto_mem(self.addr, 0x6B, b'\x00')  # wake up
+        except:
+            pass
+
+    def _read_raw(self, reg):
+        data = self.i2c.readfrom_mem(self.addr, reg, 2)
+        val = data[0] << 8 | data[1]
+        if val & 0x8000:
+            val = -((65535 - val) + 1)
+        return val
+
+    def read_accel(self):
+        ax = self._read_raw(0x3B)
+        ay = self._read_raw(0x3D)
+        az = self._read_raw(0x3F)
+        return ax, ay, az
+
+mpu = MPU6050(i2c)
+mpu_ax = mpu_ay = mpu_az = 0
+
+# ========================== TCRT5000 LINEA ==========================
+line_sensor = Pin(18, Pin.IN, Pin.PULL_UP)
+
+# ========================== GPS NEO-6M ==========================
+uart_gps = UART(0, baudrate=9600, tx=Pin(0), rx=Pin(1))
+gps_buffer = b""
+gps_lat = None
+gps_lon = None
+
+def parse_nmea_lat_lon():
+    global gps_buffer, gps_lat, gps_lon
+
+    if not uart_gps.any():
+        return
+
+    try:
+        data = uart_gps.read()
+        if data:
+            gps_buffer += data
+    except:
+        return
+
+    if b'\n' not in gps_buffer:
+        return
+
+    lines = gps_buffer.split(b'\n')
+    gps_buffer = lines[-1]
+
+    for raw in lines[:-1]:
+        line = raw.strip()
+        if not line:
+            continue
+
+        if line.startswith(b'$GPRMC'):
+            try:
+                s = line.decode('ascii', errors='ignore')
+                parts = s.split(',')
+                if len(parts) < 7:
+                    continue
+
+                status = parts[2]
+                if status != 'A':
+                    continue
+
+                lat_str = parts[3]
+                lat_hemi = parts[4]
+                lon_str = parts[5]
+                lon_hemi = parts[6]
+
+                if not lat_str or not lon_str:
+                    continue
+
+                lat_deg = int(lat_str[0:2])
+                lat_min = float(lat_str[2:])
+                lat = lat_deg + lat_min / 60.0
+                if lat_hemi == 'S':
+                    lat = -lat
+
+                lon_deg = int(lon_str[0:3])
+                lon_min = float(lon_str[3:])
+                lon = lon_deg + lon_min / 60.0
+                if lon_hemi == 'W':
+                    lon = -lon
+
+                gps_lat = lat
+                gps_lon = lon
+            except:
+                pass
+
+# ========================== NRF24L01 TELEMETRÍA (TX) ==========================
+CHANNEL_TELEM = 98
+PIPE_TX_TELEM = b'\xe1\xf0\xf0\xf0\xf0'   # IGUAL ESTILO QUE CONTROL
+PIPE_RX_DUMMY = b'\xd2\xf0\xf0\xf0\xf0'   # dummy
+
+STRUCT_FMT = '<?hhhff'   # line_val, ax, ay, az, lat, lon
+RAW_LEN = 15
+PAYLOAD_TELEM = 32       # nRF siempre 32 bytes
+
+spi_telem = SPI(0, sck=Pin(6), mosi=Pin(7), miso=Pin(4))
+ce_telem  = Pin(20, Pin.OUT, value=0)
+csn_telem = Pin(21, Pin.OUT, value=1)
+
+nrf_telem = NRF24L01(spi_telem, csn_telem, ce_telem,
+                     channel=CHANNEL_TELEM, payload_size=PAYLOAD_TELEM)
+
+try:
+    nrf_telem.set_power_speed(NRF24L01.PA_MAX, NRF24L01.SPEED_250KBPS)
+except:
+    try:
+        nrf_telem.set_power_speed(3, 0)
+    except:
+        pass
+
+try:
+    nrf_telem.set_retries(5, 15)
+except:
+    pass
+
+# MISMO PATRÓN QUE CONTROL (TX):
+nrf_telem.open_tx_pipe(PIPE_TX_TELEM)
+nrf_telem.open_rx_pipe(1, PIPE_RX_DUMMY)
+nrf_telem.stop_listening()
+
+# ========================== OLED DIBUJO ==========================
+def draw_sensors(line_val, ax, ay, az, lat, lon):
+    oled.fill(0)
+    oled.text("SENSORES CARRO", 0, 0)
+    oled.text("LINE: {}".format(line_val), 0, 10)
+    oled.text("Ax:{:5d}".format(int(ax)), 0, 20)
+    oled.text("Ay:{:5d}".format(int(ay)), 0, 30)
+    oled.text("Az:{:5d}".format(int(az)), 0, 40)
+
+    if lat is not None and lon is not None:
+        oled.text("Lat:{:.3f}".format(lat), 0, 50)
+    else:
+        oled.text("Lat: ----", 0, 50)
+
+    oled.show()
+
+# ========================== INICIALIZACIÓN ==========================
+oled.fill(0)
+oled.text("Sensores+Telem", 0, 16)
+oled.text("Canal {}".format(CHANNEL_TELEM), 0, 32)
+oled.show()
+utime.sleep(1)
+
+print("PICO B SENSORES + TELEMETRIA corriendo...")
+
+# ========================== LOOP PRINCIPAL ==========================
+while True:
+    parse_nmea_lat_lon()
+
+    line_val = line_sensor.value()
+
+    try:
+        mpu_ax, mpu_ay, mpu_az = mpu.read_accel()
+    except:
+        pass
+
+    draw_sensors(line_val, mpu_ax, mpu_ay, mpu_az, gps_lat, gps_lon)
+
+    # Telemetría hacia la base
+    try:
+        lat_send = gps_lat if gps_lat is not None else 0.0
+        lon_send = gps_lon if gps_lon is not None else 0.0
+
+        raw = struct.pack(
+            STRUCT_FMT,
+            bool(line_val),
+            int(mpu_ax),
+            int(mpu_ay),
+            int(mpu_az),
+            float(lat_send),
+            float(lon_send)
+        )
+
+        # Rellenar hasta 32 bytes (como hace realmente el driver del control-carro)
+        if len(raw) < PAYLOAD_TELEM:
+            payload = raw + bytes(PAYLOAD_TELEM - len(raw))
+        else:
+            payload = raw[:PAYLOAD_TELEM]
+
+        nrf_telem.send(payload)
+        ok = True
+    except OSError:
+        ok = False
+    except Exception as e:
+        ok = False
+
+    # Debug en consola
+    print(
+        "TX TELEM ok:{} | LINE:{} | Ax:{:6d} Ay:{:6d} Az:{:6d} | Lat:{} Lon:{}".format(
+            ok,
+            line_val,
+            int(mpu_ax), int(mpu_ay), int(mpu_az),
+            ("{:.6f}".format(gps_lat) if gps_lat is not None else "None"),
+            ("{:.6f}".format(gps_lon) if gps_lon is not None else "None"),
+        )
+    )
+
+    utime.sleep_ms(100)   # ~10 Hz

@@ -1,0 +1,110 @@
+# CONTROL TX
+# NRF24L01 + OLED + 2 JOYSTICKS  (TX con librería NRF24L01)
+# Envía v1 (dirección) y v2 (aceleración) al RX del carro
+
+from machine import Pin, SPI, I2C, ADC
+from ssd1306 import SSD1306_I2C
+from nrf24l01 import NRF24L01
+import utime, struct
+
+# ============================================================
+# OLED SSD1306 por I2C0 (SCL=GP9 / SDA=GP8)
+# ============================================================
+i2c = I2C(0, scl=Pin(9), sda=Pin(8))
+utime.sleep_ms(300)
+oled = SSD1306_I2C(128, 64, i2c)
+
+def show(l1="", l2=""):
+    oled.fill(0)
+    oled.text(l1, 0, 0)
+    oled.text(l2, 0, 16)
+    oled.show()
+
+# ============================================================
+# NRF24L01 por SPI0 (SCK=GP18, MOSI=GP19, MISO=GP16, CSN=GP17, CE=GP22)
+# (Estos pines son del CONTROL, no tienen que coincidir físicamente
+# con los de la Pico del carro, solo el canal y los pipes.)
+# ============================================================
+spi = SPI(
+    0,
+    baudrate=1_000_000,
+    polarity=0,
+    phase=0,
+    sck=Pin(18),
+    mosi=Pin(19),
+    miso=Pin(16)
+)
+
+csn = Pin(17, Pin.OUT, value=1)
+ce  = Pin(22, Pin.OUT, value=0)
+
+# Debe coincidir con el RX del carro:
+PIPE_TX = b'\xe1\xf0\xf0\xf0\xf0'   # = PIPE_RX en el RX
+PIPE_RX = b'\xd2\xf0\xf0\xf0\xf0'   # reservado, casi no se usa aquí
+CHANNEL = 100
+PAYLOAD = 4      # 2 x uint16 (v1, v2)
+
+nrf = NRF24L01(spi, csn, ce, channel=CHANNEL, payload_size=PAYLOAD)
+
+# Config extra (potencia, velocidad, reintentos)
+try:
+    nrf.set_power_speed(NRF24L01.PA_MAX, NRF24L01.SPEED_250KBPS)
+except:
+    try:
+        nrf.set_power_speed(3, 0)  # compatibilidad
+    except:
+        pass
+
+try:
+    nrf.set_retries(5, 15)   # (delay, count)
+except:
+    pass
+
+nrf.open_tx_pipe(PIPE_TX)
+nrf.open_rx_pipe(1, PIPE_RX)   # por si quisieras ACK o futuro retorno
+nrf.stop_listening()           # este es SOLO TX
+
+# ============================================================
+# JOYSTICKS
+# jst1 -> dirección, jst2 -> velocidad
+# ============================================================
+jst1 = ADC(26)   # Dirección
+jst2 = ADC(27)   # Velocidad
+
+def read_adc_filtered(adc, samples=4):
+    """Promedia varias lecturas para reducir ruido."""
+    s = 0
+    for _ in range(samples):
+        s += adc.read_u16()
+        utime.sleep_us(100)
+    return s // samples
+
+# ============================================================
+# LOOP PRINCIPAL (ENVÍO CONTINUO)
+# ============================================================
+PERIOD = 50   # ms entre envíos (~20 Hz)
+
+show("TX LISTO", f"Canal {CHANNEL}")
+utime.sleep_ms(400)
+
+while True:
+    # Lectura filtrada de los joysticks
+    v1 = read_adc_filtered(jst1)   # 0 - 65535 (dirección)
+    v2 = read_adc_filtered(jst2)   # 0 - 65535 (aceleración)
+
+    # Mostramos en OLED lo que lee
+    show("DIR:{:5d}".format(v1), "VEL:{:5d}".format(v2))
+
+    # Empaquetamos datos como binario (4 bytes: 2 x uint16)
+    payload = struct.pack('<HH', v1, v2)
+
+    # Envío continuo
+    try:
+        nrf.send(payload)
+        ok = True
+    except OSError:
+        ok = False
+
+    print("TX → DIR:{:5d} | VEL:{:5d} | ACK:{}".format(v1, v2, ok))
+
+    utime.sleep_ms(PERIOD)
