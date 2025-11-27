@@ -2,6 +2,6 @@
 Documentacion del proyecto de Comunicaciones Digitales.
 Integrantes: 
 Valentina Hernandez
-Andrey Peña
-Jorge Obando
-Brayan Daza
+-Andrey Peña
+-Jorge Obando
+-Brayan Daza
